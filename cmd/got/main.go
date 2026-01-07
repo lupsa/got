@@ -198,7 +198,7 @@ func run(ctx context.Context, c *cli.Context) error {
 		}
 
 		fmt.Print(ansi.ClearLine())
-		fmt.Println(fmt.Sprintf("✔ %s", url))
+		//		fmt.Println(fmt.Sprintf("✔ %s", url))
 	}
 
 	return nil
@@ -228,7 +228,7 @@ func multiDownload(ctx context.Context, c *cli.Context, g *got.Got, scanner *buf
 		}
 
 		fmt.Print(ansi.ClearLine())
-		fmt.Println(fmt.Sprintf("✔ %s", url))
+		//		fmt.Println(fmt.Sprintf("✔ %s", url))
 	}
 
 	return nil
