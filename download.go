@@ -155,22 +155,31 @@ func (d *Download) Init() (err error) {
 		d.ChunkSize = getDefaultChunkSize(d.info.Size, d.MinChunkSize, d.MaxChunkSize, uint64(d.Concurrency))
 	}
 
-	chunksLen := d.info.Size / d.ChunkSize
+	// If user provided a chunk size bigger than (or equal to) the file,
+	// force a single chunk download.
+	if d.ChunkSize >= d.info.Size {
+		d.ChunkSize = d.info.Size
+	}
+
+	chunksLen := (d.info.Size + d.ChunkSize - 1) / d.ChunkSize
+
+	if chunksLen == 0 {
+		chunksLen = 1
+	}
+
 	d.chunks = make([]*Chunk, 0, chunksLen)
 
-	// Set chunk ranges.
 	for i := uint64(0); i < chunksLen; i++ {
-
 		chunk := new(Chunk)
 		d.chunks = append(d.chunks, chunk)
 
 		chunk.Start = d.ChunkSize * i
 		chunk.End = chunk.Start + d.ChunkSize - 1
+
 		if chunk.End >= d.info.Size || i == chunksLen-1 {
 			chunk.End = d.info.Size - 1
 			break
 		}
-
 	}
 
 	return nil
@@ -301,39 +310,32 @@ func (d *Download) IsRangeable() bool {
 
 // Download chunks
 func (d *Download) dl(dest io.WriterAt, errC chan error) {
-
 	var (
-		// Wait group.
-		wg sync.WaitGroup
-
-		// Concurrency limit.
-		max = make(chan int, d.Concurrency)
+		wg   sync.WaitGroup
+		max  = make(chan struct{}, d.Concurrency)
+		once sync.Once
 	)
 
 	for i := 0; i < len(d.chunks); i++ {
-
-		max <- 1
+		max <- struct{}{}
 		wg.Add(1)
 
 		go func(i int) {
 			defer wg.Done()
+			defer func() { <-max }()
 
-			var once sync.Once
-
-			// Concurrently download and write chunk
-			if err := d.DownloadChunk(d.chunks[i], &OffsetWriter{dest, int64(d.chunks[i].Start)}); err != nil {
-				once.Do(func() {
-					errC <- err
-				})
+			if err := d.DownloadChunk(
+				d.chunks[i],
+				&OffsetWriter{dest, int64(d.chunks[i].Start)},
+			); err != nil {
+				once.Do(func() { errC <- err })
 				return
 			}
-
-			<-max
 		}(i)
 	}
 
 	wg.Wait()
-	errC <- nil
+	once.Do(func() { errC <- nil })
 }
 
 // Return constant path which will not change once the download starts
