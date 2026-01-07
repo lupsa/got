@@ -10,7 +10,7 @@ import (
 )
 
 var (
-	progressStyle = "block"
+	progressStyle = "single"
 	r, l          = "▕", "▏"
 )
 

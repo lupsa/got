@@ -25,10 +25,17 @@ var ErrDownloadAborted = errors.New("Operation aborted")
 // DefaultClient is the default http client for got requests.
 var DefaultClient = &http.Client{
 	Transport: &http.Transport{
-		MaxIdleConns:        10,
-		IdleConnTimeout:     30 * time.Second,
-		TLSHandshakeTimeout: 5 * time.Second,
-		Proxy:               http.ProxyFromEnvironment,
+		Proxy: http.ProxyFromEnvironment,
+
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 200,
+		MaxConnsPerHost:     0, // 0 = no explicit cap (Go will manage). Or set e.g. 200.
+
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+
+		// Optional but often helpful for download tools:
+		ForceAttemptHTTP2: true,
 	},
 }
 

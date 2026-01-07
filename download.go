@@ -164,13 +164,13 @@ func (d *Download) Init() (err error) {
 		chunk := new(Chunk)
 		d.chunks = append(d.chunks, chunk)
 
-		chunk.Start = (d.ChunkSize * i) + i
-		chunk.End = chunk.Start + d.ChunkSize
+		chunk.Start = d.ChunkSize * i
+		chunk.End = chunk.Start + d.ChunkSize - 1
 		if chunk.End >= d.info.Size || i == chunksLen-1 {
 			chunk.End = d.info.Size - 1
-			// Break on last chunk if i < chunksLen
 			break
 		}
+
 	}
 
 	return nil
@@ -198,7 +198,9 @@ func (d *Download) Start() (err error) {
 	defer file.Close()
 
 	// Allocate the file completely so that we can write concurrently
-	file.Truncate(int64(d.TotalSize()))
+	if err := file.Truncate(int64(d.TotalSize())); err != nil {
+		return err
+	}
 
 	// Download chunks.
 	errs := make(chan error, 1)
@@ -264,6 +266,9 @@ func (d *Download) Size() uint64 {
 
 // Speed returns download speed.
 func (d *Download) Speed() uint64 {
+	if d.Interval == 0 {
+		return 0
+	}
 	return (atomic.LoadUint64(&d.size) - atomic.LoadUint64(&d.lastSize)) / d.Interval * 1000
 }
 
@@ -313,9 +318,13 @@ func (d *Download) dl(dest io.WriterAt, errC chan error) {
 		go func(i int) {
 			defer wg.Done()
 
+			var once sync.Once
+
 			// Concurrently download and write chunk
 			if err := d.DownloadChunk(d.chunks[i], &OffsetWriter{dest, int64(d.chunks[i].Start)}); err != nil {
-				errC <- err
+				once.Do(func() {
+					errC <- err
+				})
 				return
 			}
 
@@ -347,6 +356,10 @@ func (d *Download) Path() string {
 	return d.path
 }
 
+func (d *Download) addProgress(n int) {
+	atomic.AddUint64(&d.size, uint64(n))
+}
+
 // DownloadChunk downloads a file chunk.
 func (d *Download) DownloadChunk(c *Chunk, dest io.Writer) error {
 
@@ -367,6 +380,10 @@ func (d *Download) DownloadChunk(c *Chunk, dest io.Writer) error {
 		return err
 	}
 
+	if res.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("expected 206 Partial Content, got %d", res.StatusCode)
+	}
+
 	// Verify the length
 	if res.ContentLength != int64(c.End-c.Start+1) {
 		return fmt.Errorf(
@@ -377,9 +394,33 @@ func (d *Download) DownloadChunk(c *Chunk, dest io.Writer) error {
 
 	defer res.Body.Close()
 
-	_, err = io.CopyN(dest, io.TeeReader(res.Body, d), res.ContentLength)
+	buf := make([]byte, 256*1024) // 256KB buffer (try 64KB–1MB)
+	remaining := res.ContentLength
 
-	return err
+	for remaining > 0 {
+		toRead := int64(len(buf))
+		if remaining < toRead {
+			toRead = remaining
+		}
+
+		n, rerr := res.Body.Read(buf[:toRead])
+		if n > 0 {
+			if _, werr := dest.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			d.addProgress(n)
+			remaining -= int64(n)
+		}
+		if rerr != nil {
+			if rerr == io.EOF && remaining == 0 {
+				break
+			}
+			return rerr
+		}
+	}
+
+	return nil
+
 }
 
 // NewDownload returns new *Download with context.
@@ -397,8 +438,8 @@ func getDefaultConcurrency() uint {
 	c := uint(runtime.NumCPU() * 3)
 
 	// Set default max concurrency to 20.
-	if c > 20 {
-		c = 20
+	if c > 64 {
+		c = 64
 	}
 
 	// Set default min concurrency to 4.

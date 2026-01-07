@@ -17,7 +17,7 @@ import (
 	"github.com/urfave/cli/v2"
 	"gitlab.com/poldi1405/go-ansi"
 	"gitlab.com/poldi1405/go-indicators/progress"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 var version string
@@ -31,13 +31,12 @@ func main() {
 
 	interruptChan := make(chan os.Signal, 1)
 
-	signal.Notify(interruptChan, syscall.SIGINT, syscall.SIGKILL, syscall.SIGTERM)
+	signal.Notify(interruptChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		<-interruptChan
 		cancel()
 		signal.Stop(interruptChan)
-		log.Fatal(got.ErrDownloadAborted)
 	}()
 
 	// CLI app.
@@ -207,7 +206,7 @@ func run(ctx context.Context, c *cli.Context) error {
 
 func getWidth() int {
 
-	if width, _, err := terminal.GetSize(0); err == nil && width > 0 {
+	if width, _, err := term.GetSize(0); err == nil && width > 0 {
 		return width
 	}
 
@@ -246,7 +245,7 @@ func download(ctx context.Context, c *cli.Context, g *got.Got, url string) (err 
 		Dir:         c.String("dir"),
 		Dest:        c.String("output"),
 		Header:      HeaderSlice,
-		Interval:    150,
+		Interval:    300,
 		ChunkSize:   c.Uint64("size"),
 		Concurrency: c.Uint("concurrency"),
 	})
