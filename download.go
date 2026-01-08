@@ -293,7 +293,7 @@ func (d *Download) AvgSpeed() uint64 {
 
 // TotalCost returns download duration.
 func (d *Download) TotalCost() time.Duration {
-	return time.Now().Sub(d.startedAt)
+	return time.Since(d.startedAt)
 }
 
 // Write updates progress size.

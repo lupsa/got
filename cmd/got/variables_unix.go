@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package main
 
@@ -11,9 +10,9 @@ import (
 
 var (
 	progressStyle = "single"
-	r, l          = "▕", "▏"
+	r, l          = "[", "]"
 )
 
-func color(content ...interface{}) string {
+func color(content ...any) string {
 	return ansi.Blue(fmt.Sprint(content...))
 }

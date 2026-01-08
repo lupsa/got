@@ -17,7 +17,7 @@ type Got struct {
 }
 
 // UserAgent is the default Got user agent to send http requests.
-var UserAgent = "Got/1.0"
+var UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0"
 
 // ErrDownloadAborted - When download is aborted by the OS before it is completed, ErrDownloadAborted will be triggered
 var ErrDownloadAborted = errors.New("Operation aborted")

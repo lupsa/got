@@ -236,6 +236,9 @@ func multiDownload(ctx context.Context, c *cli.Context, g *got.Got, scanner *buf
 
 func download(ctx context.Context, c *cli.Context, g *got.Got, url string) (err error) {
 
+	// to lazy to remove this from function or from the whole code
+	_ = ctx; 
+
 	if url, err = getURL(url); err != nil {
 		return err
 	}
@@ -245,7 +248,7 @@ func download(ctx context.Context, c *cli.Context, g *got.Got, url string) (err 
 		Dir:         c.String("dir"),
 		Dest:        c.String("output"),
 		Header:      HeaderSlice,
-		Interval:    300,
+		Interval:    150,
 		ChunkSize:   c.Uint64("size"),
 		Concurrency: c.Uint("concurrency"),
 	})
