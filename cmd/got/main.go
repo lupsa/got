@@ -177,15 +177,40 @@ func run(ctx context.Context, c *cli.Context) error {
 	}
 
 	// Parse headers BEFORE any downloads so they apply to stdin/file batches too.
+	// Parse headers BEFORE any downloads so they apply to stdin/file batches too.
 	if c.StringSlice("header") != nil {
-		header := c.StringSlice("header")
+		raw := c.StringSlice("header")
 
-		for _, h := range header {
+		// urfave/cli StringSlice splits on commas, which breaks values like:
+		// -H 'Accept: application/json, text/plain, */*'
+		// Re-join fragments that were split by commas but are still part of the previous header.
+		fixed := make([]string, 0, len(raw))
+		for _, s := range raw {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			if strings.Contains(s, ":") || len(fixed) == 0 {
+				fixed = append(fixed, s)
+			} else {
+				fixed[len(fixed)-1] += ", " + s
+			}
+		}
+
+		for _, h := range fixed {
 			split := strings.SplitN(h, ":", 2)
 			if len(split) == 1 {
 				return errors.New("malformatted header " + h)
 			}
-			HeaderSlice = append(HeaderSlice, got.GotHeader{Key: split[0], Value: strings.TrimSpace(split[1])})
+
+			key := strings.TrimSpace(split[0])
+			val := strings.TrimSpace(split[1])
+
+			// Prevent header injection / invalid values (got log shows embedded newlines).
+			val = strings.ReplaceAll(val, "\r", " ")
+			val = strings.ReplaceAll(val, "\n", " ")
+
+			HeaderSlice = append(HeaderSlice, got.GotHeader{Key: key, Value: val})
 		}
 	}
 
