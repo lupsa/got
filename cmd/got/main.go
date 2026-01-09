@@ -109,18 +109,39 @@ func run(ctx context.Context, c *cli.Context) error {
 
 	// Progress func.
 	g.ProgressFunc = func(d *got.Download) {
+		width := getWidth()
 
-		// 55 is just an estimation of the text showed with the progress.
-		// it's working fine with $COLUMNS >= 47
-		p.Width = getWidth() - 55
+		// 55 is just an estimation of the text shown with the progress.
+		p.Width = width - 55
+		if p.Width < 0 {
+			p.Width = 0
+		}
 
-		perc, err := progress.GetPercentage(float64(d.Size()), float64(d.TotalSize()))
+		size := d.Size()
+		total := d.TotalSize()
+		speed := d.Speed()
+
+		// Unknown total size (no Content-Length / no range support). Don't pretend it's 100%.
+		if total == 0 {
+			fmt.Printf(
+				" %s @ %s/s%s\r",
+				humanize.Bytes(size),
+				humanize.Bytes(speed),
+				ansi.ClearRight(),
+			)
+			return
+		}
+
+		perc, err := progress.GetPercentage(float64(size), float64(total))
 		if err != nil {
+			perc = 0
+		}
+		if perc > 100 {
 			perc = 100
 		}
 
 		var bar string
-		if getWidth() <= 46 {
+		if width <= 46 || p.Width == 0 {
 			bar = ""
 		} else {
 			bar = r + color(p.GetBar(perc, 100)) + l
@@ -130,9 +151,9 @@ func run(ctx context.Context, c *cli.Context) error {
 			" %6.2f%% %s %s/%s @ %s/s%s\r",
 			perc,
 			bar,
-			humanize.Bytes(d.Size()),
-			humanize.Bytes(d.TotalSize()),
-			humanize.Bytes(d.Speed()),
+			humanize.Bytes(size),
+			humanize.Bytes(total),
+			humanize.Bytes(speed),
 			ansi.ClearRight(),
 		)
 	}
@@ -143,17 +164,29 @@ func run(ctx context.Context, c *cli.Context) error {
 		return err
 	}
 
-	// Create dir if not exists.
-	if c.String("dir") != "" {
-
-		if _, err := os.Stat(c.String("dir")); os.IsNotExist(err) {
-			os.MkdirAll(c.String("dir"), os.ModePerm)
+	// Ensure output directory exists (MkdirAll is idempotent).
+	if dir := c.String("dir"); dir != "" {
+		if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+			return err
 		}
 	}
 
 	// Set default user agent.
 	if c.String("agent") != "" {
 		got.UserAgent = c.String("agent")
+	}
+
+	// Parse headers BEFORE any downloads so they apply to stdin/file batches too.
+	if c.StringSlice("header") != nil {
+		header := c.StringSlice("header")
+
+		for _, h := range header {
+			split := strings.SplitN(h, ":", 2)
+			if len(split) == 1 {
+				return errors.New("malformatted header " + h)
+			}
+			HeaderSlice = append(HeaderSlice, got.GotHeader{Key: split[0], Value: strings.TrimSpace(split[1])})
+		}
 	}
 
 	// Piped stdin
@@ -173,20 +206,10 @@ func run(ctx context.Context, c *cli.Context) error {
 			return err
 		}
 
+		defer file.Close()
+
 		if err := multiDownload(ctx, c, g, bufio.NewScanner(file)); err != nil {
 			return err
-		}
-	}
-
-	if c.StringSlice("header") != nil {
-		header := c.StringSlice("header")
-
-		for _, h := range header {
-			split := strings.SplitN(h, ":", 2)
-			if len(split) == 1 {
-				return errors.New("malformatted header " + h)
-			}
-			HeaderSlice = append(HeaderSlice, got.GotHeader{Key: split[0], Value: strings.TrimSpace(split[1])})
 		}
 	}
 
@@ -231,13 +254,15 @@ func multiDownload(ctx context.Context, c *cli.Context, g *got.Got, scanner *buf
 		//		fmt.Println(fmt.Sprintf("✔ %s", url))
 	}
 
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func download(ctx context.Context, c *cli.Context, g *got.Got, url string) (err error) {
-
-	// to lazy to remove this from function or from the whole code
-	_ = ctx; 
+	_ = ctx // ctx is carried by g (got.NewWithContext) and injected by Got.Do.
 
 	if url, err = getURL(url); err != nil {
 		return err
@@ -256,15 +281,17 @@ func download(ctx context.Context, c *cli.Context, g *got.Got, url string) (err 
 
 func getURL(URL string) (string, error) {
 
+	// net/url parses inputs without a scheme as a *path* (e.g. "example.com/a"),
+	// which would turn into "https:example.com/a" if we only set u.Scheme.
+	// Prefix a scheme explicitly so we reliably get "https://...".
+	if !strings.Contains(URL, "://") {
+		URL = "https://" + URL
+	}
+
 	u, err := url.Parse(URL)
 
 	if err != nil {
 		return "", err
-	}
-
-	// Fallback to https by default.
-	if u.Scheme == "" {
-		u.Scheme = "https"
 	}
 
 	return u.String(), nil

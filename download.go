@@ -15,6 +15,10 @@ import (
 	"time"
 )
 
+// Reuse large copy buffers across goroutines to reduce allocations/GC.
+// 1MiB is usually large enough to be syscall-efficient without exploding RAM.
+var copyBufPool = sync.Pool{New: func() any { return make([]byte, 1024*1024) }}
+
 type (
 
 	// Info holds downloadable file info.
@@ -61,18 +65,22 @@ type (
 	}
 )
 
-// Try downloading the first byte of the file using a range request.
-// If the server supports range requests, then we'll extract the length info from content-range,
-// Otherwise this just downloads the whole file in one go
-func (d *Download) GetInfoOrDownload() (*Info, error) {
+// GetInfo probes the URL (cheaply) to determine:
+//   - total size (when available)
+//   - whether the server supports byte-range requests (RFC 7233)
+//
+// IMPORTANT: This method must NOT download the file to disk.
+// The actual download happens in Start() so progress reporting can run.
+func (d *Download) GetInfo() (*Info, error) {
 
 	var (
-		err  error
-		dest *os.File
-		req  *http.Request
-		res  *http.Response
+		err error
+		req *http.Request
+		res *http.Response
 	)
 
+	// Probe with a 1-byte range request. If the server supports ranges it should
+	// respond with 206 and Content-Range: bytes 0-0/<total>.
 	if req, err = NewRequest(d.ctx, "GET", d.URL, append(d.Header, GotHeader{"Range", "bytes=0-0"})); err != nil {
 		return &Info{}, err
 	}
@@ -83,39 +91,44 @@ func (d *Download) GetInfoOrDownload() (*Info, error) {
 	defer res.Body.Close()
 
 	if res.StatusCode >= 300 {
-		return &Info{}, fmt.Errorf("Response status code is not ok: %d", res.StatusCode)
+		return &Info{}, fmt.Errorf("response status code is not ok: %d", res.StatusCode)
 	}
 
-	// Set content disposition non trusted name
+	// Capture Content-Disposition filename (non-trusted) if present.
 	d.unsafeName = res.Header.Get("content-disposition")
 
-	if dest, err = os.Create(d.Path()); err != nil {
-		return &Info{}, err
-	}
-	defer dest.Close()
-
-	if _, err = io.Copy(dest, io.TeeReader(res.Body, d)); err != nil {
-		return &Info{}, err
-	}
-
-	// Get content length from content-range response header,
-	// if content-range exists, that means partial content is supported.
-	if cr := res.Header.Get("content-range"); cr != "" && res.ContentLength == 1 {
-		l := strings.Split(cr, "/")
-		if len(l) == 2 {
-			if length, err := strconv.ParseUint(l[1], 10, 64); err == nil {
-
-				return &Info{
-					Size:      length,
-					Rangeable: true,
-				}, nil
-			}
+	// Range supported.
+	if res.StatusCode == http.StatusPartialContent {
+		// Body should be tiny (1 byte). Only drain it when it's actually tiny,
+		// so a misbehaving server can't trick us into downloading a full file here.
+		if res.ContentLength > 0 && res.ContentLength <= 1024*1024 {
+			_, _ = io.Copy(io.Discard, res.Body)
 		}
-		// Make sure the caller knows about the problem and we don't just silently fail
-		return &Info{}, fmt.Errorf("Response includes content-range header which is invalid: %s", cr)
+
+		cr := res.Header.Get("content-range")
+		if cr == "" {
+			return &Info{}, fmt.Errorf("expected content-range header on 206 response")
+		}
+		l := strings.Split(cr, "/")
+		if len(l) != 2 {
+			return &Info{}, fmt.Errorf("invalid content-range header: %s", cr)
+		}
+		length, perr := strconv.ParseUint(l[1], 10, 64)
+		if perr != nil {
+			return &Info{}, fmt.Errorf("invalid content-range total size: %s", cr)
+		}
+
+		return &Info{Size: length, Rangeable: true}, nil
 	}
 
-	return &Info{}, nil
+	// Range not supported (server may ignore Range and respond 200).
+	// Do NOT read the body here (it could be the whole file). We'll download in Start().
+	var size uint64
+	if res.ContentLength > 0 {
+		size = uint64(res.ContentLength)
+	}
+
+	return &Info{Size: size, Rangeable: false}, nil
 }
 
 // Init set defaults and split file into chunks and gets Info,
@@ -135,12 +148,16 @@ func (d *Download) Init() (err error) {
 		d.ctx = context.Background()
 	}
 
-	// Get URL info and partial content support state
-	if d.info, err = d.GetInfoOrDownload(); err != nil {
+	// Reset progress counters in case Download is reused.
+	atomic.StoreUint64(&d.size, 0)
+	atomic.StoreUint64(&d.lastSize, 0)
+
+	// Get URL info and partial content support state (no disk IO here).
+	if d.info, err = d.GetInfo(); err != nil {
 		return err
 	}
 
-	// Partial content not supported, and the file downladed.
+	// If the server doesn't support ranges, we'll download in Start() with a single GET.
 	if d.info.Rangeable == false {
 		return nil
 	}
@@ -188,32 +205,33 @@ func (d *Download) Init() (err error) {
 // Start downloads the file chunks, and merges them.
 // Must be called only after init
 func (d *Download) Start() (err error) {
-	// If the file was already downloaded during GetInfoOrDownload, then there will be no chunks
+	// Single-stream download fallback.
 	if d.info.Rangeable == false {
-		select {
-		case <-d.ctx.Done():
-			return d.ctx.Err()
-		default:
-			return nil
-		}
+		return d.downloadSingle(d.ctx)
 	}
 
-	// Otherwise there are always at least 2 chunks
+	filePath := d.Path()
+	if err := os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
+		return err
+	}
 
-	file, err := os.Create(d.Path())
+	file, err := os.Create(filePath)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	// Allocate the file completely so that we can write concurrently
+	// Allocate the file completely so that we can write concurrently.
 	if err := file.Truncate(int64(d.TotalSize())); err != nil {
 		return err
 	}
 
+	ctx, cancel := context.WithCancel(d.ctx)
+	defer cancel()
+
 	// Download chunks.
 	errs := make(chan error, 1)
-	go d.dl(file, errs)
+	go d.dl(ctx, cancel, file, errs)
 
 	select {
 	case err = <-errs:
@@ -221,7 +239,7 @@ func (d *Download) Start() (err error) {
 		err = d.ctx.Err()
 	}
 
-	return
+	return err
 }
 
 // RunProgress runs ProgressFunc based on Interval and updates lastSize.
@@ -309,7 +327,7 @@ func (d *Download) IsRangeable() bool {
 }
 
 // Download chunks
-func (d *Download) dl(dest io.WriterAt, errC chan error) {
+func (d *Download) dl(ctx context.Context, cancel context.CancelFunc, dest io.WriterAt, errC chan error) {
 	var (
 		wg   sync.WaitGroup
 		max  = make(chan struct{}, d.Concurrency)
@@ -324,11 +342,15 @@ func (d *Download) dl(dest io.WriterAt, errC chan error) {
 			defer wg.Done()
 			defer func() { <-max }()
 
-			if err := d.DownloadChunk(
+			if err := d.DownloadChunk(ctx,
 				d.chunks[i],
 				&OffsetWriter{dest, int64(d.chunks[i].Start)},
 			); err != nil {
-				once.Do(func() { errC <- err })
+				once.Do(func() {
+					// Stop the rest of the chunk requests ASAP.
+					cancel()
+					errC <- err
+				})
 				return
 			}
 		}(i)
@@ -363,7 +385,7 @@ func (d *Download) addProgress(n int) {
 }
 
 // DownloadChunk downloads a file chunk.
-func (d *Download) DownloadChunk(c *Chunk, dest io.Writer) error {
+func (d *Download) DownloadChunk(ctx context.Context, c *Chunk, dest io.Writer) error {
 
 	var (
 		err error
@@ -371,7 +393,7 @@ func (d *Download) DownloadChunk(c *Chunk, dest io.Writer) error {
 		res *http.Response
 	)
 
-	if req, err = NewRequest(d.ctx, "GET", d.URL, d.Header); err != nil {
+	if req, err = NewRequest(ctx, "GET", d.URL, d.Header); err != nil {
 		return err
 	}
 
@@ -381,48 +403,73 @@ func (d *Download) DownloadChunk(c *Chunk, dest io.Writer) error {
 	if res, err = d.Client.Do(req); err != nil {
 		return err
 	}
+	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusPartialContent {
 		return fmt.Errorf("expected 206 Partial Content, got %d", res.StatusCode)
 	}
 
 	// Verify the length
-	if res.ContentLength != int64(c.End-c.Start+1) {
+	expectedLen := int64(c.End - c.Start + 1)
+	if res.ContentLength != -1 && res.ContentLength != expectedLen {
 		return fmt.Errorf(
 			"Range request returned invalid Content-Length: %d however the range was: %s",
 			res.ContentLength, contentRange,
 		)
 	}
 
-	defer res.Body.Close()
+	buf := copyBufPool.Get().([]byte)
+	defer copyBufPool.Put(buf)
 
-	buf := make([]byte, 256*1024) // 256KB buffer (try 64KB–1MB)
-	remaining := res.ContentLength
+	// Copy exactly the requested number of bytes. This protects us against a server
+	// that (incorrectly) sends more data than the requested range.
+	limited := io.LimitReader(res.Body, expectedLen)
 
-	for remaining > 0 {
-		toRead := int64(len(buf))
-		if remaining < toRead {
-			toRead = remaining
-		}
-
-		n, rerr := res.Body.Read(buf[:toRead])
-		if n > 0 {
-			if _, werr := dest.Write(buf[:n]); werr != nil {
-				return werr
-			}
-			d.addProgress(n)
-			remaining -= int64(n)
-		}
-		if rerr != nil {
-			if rerr == io.EOF && remaining == 0 {
-				break
-			}
-			return rerr
-		}
+	// Count progress by also writing the bytes into d (which only increments the counter).
+	n, err := io.CopyBuffer(io.MultiWriter(dest, d), limited, buf)
+	if err != nil {
+		return err
+	}
+	if n != expectedLen {
+		return fmt.Errorf("range request returned %d bytes, expected %d", n, expectedLen)
 	}
 
 	return nil
 
+}
+
+func (d *Download) downloadSingle(ctx context.Context) error {
+	filePath := d.Path()
+	if err := os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
+		return err
+	}
+
+	file, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	req, err := NewRequest(ctx, "GET", d.URL, d.Header)
+	if err != nil {
+		return err
+	}
+
+	res, err := d.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode >= 300 {
+		return fmt.Errorf("response status code is not ok: %d", res.StatusCode)
+	}
+
+	buf := copyBufPool.Get().([]byte)
+	defer copyBufPool.Put(buf)
+
+	_, err = io.CopyBuffer(io.MultiWriter(file, d), res.Body, buf)
+	return err
 }
 
 // NewDownload returns new *Download with context.

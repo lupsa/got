@@ -3,6 +3,7 @@ package got
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"time"
 )
@@ -26,6 +27,16 @@ var ErrDownloadAborted = errors.New("Operation aborted")
 var DefaultClient = &http.Client{
 	Transport: &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
+
+		// For file downloads we almost always want the raw bytes (no gzip/deflate),
+		// especially because Range requests + compression can produce unexpected
+		// Content-Length/content-range behavior.
+		DisableCompression: true,
+
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 
 		MaxIdleConns:        200,
 		MaxIdleConnsPerHost: 200,
@@ -52,6 +63,15 @@ func (g Got) Download(URL, dest string) error {
 
 // Do inits and runs ProgressFunc if set and starts the Download.
 func (g Got) Do(dl *Download) error {
+
+	// If the caller constructed Download manually (common), make sure we still
+	// honor Got's configured context and client.
+	if dl.ctx == nil {
+		dl.ctx = g.ctx
+	}
+	if dl.Client == nil {
+		dl.Client = g.Client
+	}
 
 	if err := dl.Init(); err != nil {
 		return err

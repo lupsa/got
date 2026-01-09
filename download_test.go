@@ -54,7 +54,7 @@ func getInfoTest(t *testing.T) {
 
 	dl := got.NewDownload(context.Background(), httpt.URL+"/ok_file", tmpFile)
 
-	info, err := dl.GetInfoOrDownload()
+	info, err := dl.GetInfo()
 
 	if err != nil {
 		t.Error(err)
@@ -83,7 +83,7 @@ func sendHeadersTest(t *testing.T) {
 		},
 	}
 
-	info, err := dl.GetInfoOrDownload()
+	info, err := dl.GetInfo()
 
 	if err != nil {
 		t.Error(err)
@@ -101,13 +101,18 @@ func sendHeadersTest(t *testing.T) {
 
 func getFilenameTest(t *testing.T) {
 
-	tmpDir := os.TempDir()
+	// Use an isolated temp directory. Using os.TempDir() here would remove the
+	// *entire* system temp directory when deferred cleanup runs.
+	tmpDir, err := ioutil.TempDir("", "got-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer os.RemoveAll(tmpDir)
 
 	dl := got.NewDownload(context.Background(), httpt.URL+"/file_name", "")
 	dl.Dir = tmpDir
 
-	_, err := dl.GetInfoOrDownload()
+	_, err = dl.GetInfo()
 
 	if err != nil {
 
@@ -251,7 +256,8 @@ func downloadOkFileContentTest(t *testing.T) {
 
 func downloadTimeoutContextTest(t *testing.T) {
 
-	tmpFile, _ := ioutil.TempDir("", "")
+	// 1) Init should fail if the context is already canceled.
+	tmpFile := createTemp()
 	defer clean(tmpFile)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -261,14 +267,27 @@ func downloadTimeoutContextTest(t *testing.T) {
 	d.ChunkSize = 2
 
 	if err := d.Init(); err == nil {
-		t.Error("Expecting context deadline")
+		t.Error("Expecting canceled context error")
 	}
 
-	if err := d.Start(); err == nil {
-		t.Error("Expecting context deadline")
+	// Start() must only be called after a successful Init(). Create a new download,
+	// init it, then cancel before Start to verify Start respects context cancellation.
+	tmpFile2 := createTemp()
+	defer clean(tmpFile2)
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	d2 := got.NewDownload(ctx2, httpt.URL+"/ok_file_with_range_delay", tmpFile2)
+	d2.ChunkSize = 2
+
+	if err := d2.Init(); err != nil {
+		t.Error(err)
+		return
 	}
 
-	d = got.NewDownload(ctx, httpt.URL+"/ok_file_with_range_delay", tmpFile)
+	cancel2()
+	if err := d2.Start(); err == nil {
+		t.Error("Expecting canceled context error")
+	}
 
 	// just to cover request error.
 	g := got.NewWithContext(ctx)
@@ -295,20 +314,33 @@ func downloadHeadNotSupported(t *testing.T) {
 		return
 	}
 
-	if d.TotalSize() != 0 {
-		t.Error("Size should be 0")
+	// When the server doesn't support ranges we may or may not know the total size
+	// (depending on whether Content-Length is present). Both are valid.
+	if d.TotalSize() != 0 && d.TotalSize() != 10 {
+		t.Errorf("Size should be 0 (unknown) or 10, got %d", d.TotalSize())
 	}
 
 	if d.IsRangeable() != false {
 		t.Error("rangeable should be false")
 	}
 
+	// Invalid destination path should fail on Start (Init doesn't touch the FS now).
+	// Use a directory path as Dest, so os.Create(Dest) fails with "is a directory".
+	badDest, err := ioutil.TempDir("", "got-test-bad-dest-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clean(badDest)
 	d = &got.Download{
 		URL:  httpt.URL + "/found_and_head_not_allowed",
-		Dest: "/invalid/path",
+		Dest: badDest,
 	}
 
-	if err := d.Init(); err == nil {
+	if err := d.Init(); err != nil {
+		t.Error(err)
+		return
+	}
+	if err := d.Start(); err == nil {
 		t.Error("Expecting invalid path error")
 	}
 }
@@ -328,8 +360,9 @@ func downloadPartialContentNotSupportedTest(t *testing.T) {
 		return
 	}
 
-	if d.TotalSize() != 0 {
-		t.Errorf("Expect length to be 0, but got %d", d.TotalSize())
+	// Size can be unknown (0) or known via Content-Length.
+	if d.TotalSize() != 0 && d.TotalSize() != 10 {
+		t.Errorf("Expect length to be 0 (unknown) or 10, but got %d", d.TotalSize())
 	}
 
 	if err := d.Start(); err != nil {
@@ -415,6 +448,5 @@ func createTemp() string {
 }
 
 func clean(tmpFile string) {
-
-	os.Remove(tmpFile)
+	os.RemoveAll(tmpFile)
 }
