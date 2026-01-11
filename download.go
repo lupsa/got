@@ -1,6 +1,7 @@
 package got
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ type (
 	Info struct {
 		Size      uint64
 		Rangeable bool
+		SidxAll   []*SidxRanges
 	}
 
 	// ProgressFunc to show progress state, called by RunProgress based on interval.
@@ -57,13 +60,128 @@ type (
 		chunks []*Chunk
 
 		startedAt time.Time
+
+		Keys []*RawKeys
 	}
 
 	GotHeader struct {
 		Key   string
 		Value string
 	}
+
+	RawKeys struct {
+		Kid string
+		Key string
+	}
 )
+
+// makeAlignedChunks builds chunk ranges that never split any init/media segment range.
+//
+// We use the first parsed sidx's ranges. In typical DASH/CMAF flows this is sufficient
+// because audio/video segments are often aligned; if they aren't, prefer a manifest-based
+// segment list.
+func makeAlignedChunks(totalSize, targetChunkSize uint64, sidxAll []*SidxRanges) []*Chunk {
+	if totalSize == 0 {
+		return nil
+	}
+	if targetChunkSize == 0 || targetChunkSize >= totalSize {
+		c := new(Chunk)
+		c.Start = 0
+		c.End = totalSize - 1
+		return []*Chunk{c}
+	}
+	if len(sidxAll) == 0 || sidxAll[0] == nil {
+		return nil
+	}
+
+	sidx := sidxAll[0]
+	units := make([]Range, 0, 1+len(sidx.Segments))
+	units = append(units, sidx.Init)
+	units = append(units, sidx.Segments...)
+	if len(units) == 0 {
+		return nil
+	}
+
+	// Sort + sanitize.
+	sort.Slice(units, func(i, j int) bool { return units[i].Start < units[j].Start })
+	sanitized := make([]Range, 0, len(units)+1)
+	lastEOF := int64(totalSize - 1)
+	for _, u := range units {
+		if u.End < 0 || u.Start > lastEOF {
+			continue
+		}
+		if u.Start < 0 {
+			u.Start = 0
+		}
+		if u.End > lastEOF {
+			u.End = lastEOF
+		}
+		if u.End < u.Start {
+			continue
+		}
+		sanitized = append(sanitized, u)
+	}
+	if len(sanitized) == 0 {
+		return nil
+	}
+
+	// Merge overlapping/adjacent ranges.
+	merged := make([]Range, 0, len(sanitized)+1)
+	cur := sanitized[0]
+	for i := 1; i < len(sanitized); i++ {
+		u := sanitized[i]
+		if u.Start <= cur.End+1 {
+			if u.End > cur.End {
+				cur.End = u.End
+			}
+			continue
+		}
+		merged = append(merged, cur)
+		cur = u
+	}
+	merged = append(merged, cur)
+
+	// Fill any gaps so we still cover the whole file.
+	filled := make([]Range, 0, len(merged)+2)
+	pos := int64(0)
+	for _, u := range merged {
+		if pos < u.Start {
+			filled = append(filled, Range{Start: pos, End: u.Start - 1})
+		}
+		filled = append(filled, u)
+		pos = u.End + 1
+	}
+	if pos <= lastEOF {
+		filled = append(filled, Range{Start: pos, End: lastEOF})
+	}
+
+	// Group units into chunks without splitting any unit.
+	chunks := make([]*Chunk, 0, (totalSize+targetChunkSize-1)/targetChunkSize)
+	var curStart, curEnd int64
+	curStart = filled[0].Start
+	curEnd = filled[0].End
+	for i := 1; i < len(filled); i++ {
+		u := filled[i]
+		// If adding this unit would exceed the target, flush current chunk.
+		if curEnd-curStart+1+(u.End-u.Start+1) > int64(targetChunkSize) {
+			c := new(Chunk)
+			c.Start = uint64(curStart)
+			c.End = uint64(curEnd)
+			chunks = append(chunks, c)
+			curStart = u.Start
+			curEnd = u.End
+			continue
+		}
+		curEnd = u.End
+	}
+	// Flush last chunk.
+	last := new(Chunk)
+	last.Start = uint64(curStart)
+	last.End = uint64(curEnd)
+	chunks = append(chunks, last)
+
+	return chunks
+}
 
 // GetInfo probes the URL (cheaply) to determine:
 //   - total size (when available)
@@ -118,7 +236,10 @@ func (d *Download) GetInfo() (*Info, error) {
 			return &Info{}, fmt.Errorf("invalid content-range total size: %s", cr)
 		}
 
-		return &Info{Size: length, Rangeable: true}, nil
+		info := &Info{Size: length, Rangeable: true}
+		// Best-effort sidx range extraction (does not affect errors).
+		d.tryFetchSidxRanges(d.ctx, info)
+		return info, nil
 	}
 
 	// Range not supported (server may ignore Range and respond 200).
@@ -128,7 +249,58 @@ func (d *Download) GetInfo() (*Info, error) {
 		size = uint64(res.ContentLength)
 	}
 
-	return &Info{Size: size, Rangeable: false}, nil
+	info := &Info{Size: size, Rangeable: false}
+	return info, nil
+}
+
+// tryFetchSidxRanges is a best-effort probe that downloads a small prefix of the file and
+// attempts to extract all top-level sidx ranges. It never errors GetInfo().
+func (d *Download) tryFetchSidxRanges(ctx context.Context, info *Info) {
+	if info == nil || !info.Rangeable || info.Size == 0 {
+		return
+	}
+
+	// Many fragmented MP4/DASH files place sidx near the start. We only fetch a small prefix
+	// to keep GetInfo() cheap.
+	const probeMax = 4 * 1024 * 1024 // 4 MiB
+	end := int64(probeMax - 1)
+	if info.Size > 0 {
+		last := int64(info.Size - 1)
+		if end > last {
+			end = last
+		}
+	}
+	if end < 0 {
+		return
+	}
+
+	req, err := NewRequest(ctx, "GET", d.URL, append(d.Header, GotHeader{"Range", fmt.Sprintf("bytes=0-%d", end)}))
+	if err != nil {
+		return
+	}
+
+	res, err := d.Client.Do(req)
+	if err != nil {
+		return
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusPartialContent {
+		return
+	}
+
+	buf, err := io.ReadAll(io.LimitReader(res.Body, end+1))
+	if err != nil || len(buf) == 0 {
+		return
+	}
+
+	// Parse sidx from the probe buffer (must be seekable).
+	sidxAll, err := FromReadSeekerAll(bytes.NewReader(buf))
+	if err != nil || len(sidxAll) == 0 {
+		return
+	}
+
+	info.SidxAll = sidxAll
 }
 
 // Init set defaults and split file into chunks and gets Info,
@@ -176,6 +348,13 @@ func (d *Download) Init() (err error) {
 	// force a single chunk download.
 	if d.ChunkSize >= d.info.Size {
 		d.ChunkSize = d.info.Size
+	}
+
+	// If we have sidx-derived segment ranges, prefer chunk boundaries that never
+	// split any init/media segment.
+	if aligned := makeAlignedChunks(d.info.Size, d.ChunkSize, d.info.SidxAll); len(aligned) > 0 {
+		d.chunks = aligned
+		return nil
 	}
 
 	chunksLen := (d.info.Size + d.ChunkSize - 1) / d.ChunkSize
@@ -426,13 +605,29 @@ func (d *Download) DownloadChunk(ctx context.Context, c *Chunk, dest io.Writer) 
 	// that (incorrectly) sends more data than the requested range.
 	limited := io.LimitReader(res.Body, expectedLen)
 
-	// Count progress by also writing the bytes into d (which only increments the counter).
-	n, err := io.CopyBuffer(io.MultiWriter(dest, d), limited, buf)
-	if err != nil {
-		return err
-	}
-	if n != expectedLen {
-		return fmt.Errorf("range request returned %d bytes, expected %d", n, expectedLen)
+	if d.Keys != nil {
+		// Count progress on encrypted bytes coming from the network:
+		tee := io.TeeReader(limited, d)
+
+		// Decrypt on-the-fly and write directly into final file at offset:
+		if err := d.decryptStreamWithShaka(ctx, tee, dest, "video"); err != nil {
+			// Optional: fallback to audio stream if video fails
+			if err2 := d.decryptStreamWithShaka(ctx, tee, dest, "audio"); err2 != nil {
+				return err // or return combined error
+			}
+		}
+		return nil
+	} else {
+
+		// Count progress by also writing the bytes into d (which only increments the counter).
+		n, err := io.CopyBuffer(io.MultiWriter(dest, d), limited, buf)
+		if err != nil {
+			return err
+		}
+		if n != expectedLen {
+			return fmt.Errorf("range request returned %d bytes, expected %d", n, expectedLen)
+		}
+
 	}
 
 	return nil
@@ -470,8 +665,13 @@ func (d *Download) downloadSingle(ctx context.Context) error {
 	buf := copyBufPool.Get().([]byte)
 	defer copyBufPool.Put(buf)
 
-	_, err = io.CopyBuffer(io.MultiWriter(file, d), res.Body, buf)
-	return err
+	if d.Keys != nil {
+		return fmt.Errorf("Implement decryption of parts")
+	} else {
+		_, err = io.CopyBuffer(io.MultiWriter(file, d), res.Body, buf)
+		return err
+	}
+
 }
 
 // NewDownload returns new *Download with context.

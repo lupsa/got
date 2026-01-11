@@ -11,8 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"syscall"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/dustin/go-humanize"
 	"github.com/melbahja/got"
@@ -22,9 +22,11 @@ import (
 	"golang.org/x/term"
 )
 
-var version string
-
-var HeaderSlice []got.GotHeader
+var (
+	version     string
+	HeaderSlice []got.GotHeader
+	KeySlice    []*got.RawKeys
+)
 
 func main() {
 
@@ -83,6 +85,11 @@ func main() {
 				Name:    "agent",
 				Usage:   `Set user agent for got HTTP requests.`,
 				Aliases: []string{"u"},
+			},
+			&cli.StringSliceFlag{
+				Name:    "key",
+				Usage:   `Set kid:key for decryption`,
+				Aliases: []string{"k"},
 			},
 		},
 		Version: version,
@@ -218,6 +225,21 @@ func run(ctx context.Context, c *cli.Context) error {
 		}
 	}
 
+	if keys := c.StringSlice("key"); len(keys) > 0 {
+		rawKeys := c.StringSlice("key")
+		for _, s := range rawKeys {
+			parts := strings.SplitN(s, ":", 2)
+			if len(parts) != 2 {
+				return fmt.Errorf("invalid --key %q, expected kid:key", s)
+			}
+			KeySlice = append(KeySlice, &got.RawKeys{
+				Kid: parts[0],
+				Key: parts[1],
+			})
+		}
+
+	}
+
 	// Piped stdin
 	if info.Mode()&os.ModeNamedPipe > 0 || info.Size() > 0 {
 
@@ -249,7 +271,7 @@ func run(ctx context.Context, c *cli.Context) error {
 			return err
 		}
 
-//		fmt.Print(ansi.ClearLine())
+		//		fmt.Print(ansi.ClearLine())
 		//		fmt.Println(fmt.Sprintf("✔ %s", url))
 	}
 
@@ -302,6 +324,7 @@ func download(ctx context.Context, c *cli.Context, g *got.Got, url string) (err 
 		Dir:         c.String("dir"),
 		Dest:        c.String("output"),
 		Header:      HeaderSlice,
+		Keys:        KeySlice,
 		Interval:    150,
 		ChunkSize:   c.Uint64("size"),
 		Concurrency: c.Uint("concurrency"),
