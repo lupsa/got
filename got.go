@@ -3,6 +3,7 @@ package got
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -19,6 +20,9 @@ type Got struct {
 
 // UserAgent is the default Got user agent to send http requests.
 var UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0"
+
+// Logger is optional. If nil, got stays silent.
+var Logger *slog.Logger
 
 // ErrDownloadAborted - When download is aborted by the OS before it is completed, ErrDownloadAborted will be triggered
 var ErrDownloadAborted = errors.New("Operation aborted")
@@ -48,6 +52,17 @@ var DefaultClient = &http.Client{
 		// Optional but often helpful for download tools:
 		ForceAttemptHTTP2: true,
 	},
+}
+
+func logDebug(msg string, args ...any) {
+	if Logger != nil {
+		Logger.Debug(msg, args...)
+	}
+}
+func logWarn(msg string, args ...any) {
+	if Logger != nil {
+		Logger.Warn(msg, args...)
+	}
 }
 
 // Download creates *Download item and runs it.

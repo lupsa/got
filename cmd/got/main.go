@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/url"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"sync/atomic"
 
 	"github.com/dustin/go-humanize"
 	"github.com/melbahja/got"
@@ -25,6 +27,9 @@ var version string
 var HeaderSlice []got.GotHeader
 
 func main() {
+
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	got.Logger = slog.New(handler)
 
 	// New context.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -132,7 +137,7 @@ func run(ctx context.Context, c *cli.Context) error {
 			return
 		}
 
-		perc, err := progress.GetPercentage(float64(size), float64(total))
+		perc, err := progress.GetPercentage(float64(atomic.LoadUint64(&size)), float64(total))
 		if err != nil {
 			perc = 0
 		}
@@ -176,7 +181,6 @@ func run(ctx context.Context, c *cli.Context) error {
 		got.UserAgent = c.String("agent")
 	}
 
-	// Parse headers BEFORE any downloads so they apply to stdin/file batches too.
 	// Parse headers BEFORE any downloads so they apply to stdin/file batches too.
 	if c.StringSlice("header") != nil {
 		raw := c.StringSlice("header")
@@ -245,7 +249,7 @@ func run(ctx context.Context, c *cli.Context) error {
 			return err
 		}
 
-		fmt.Print(ansi.ClearLine())
+//		fmt.Print(ansi.ClearLine())
 		//		fmt.Println(fmt.Sprintf("✔ %s", url))
 	}
 

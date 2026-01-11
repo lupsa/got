@@ -245,34 +245,34 @@ func (d *Download) Start() (err error) {
 // RunProgress runs ProgressFunc based on Interval and updates lastSize.
 func (d *Download) RunProgress(fn ProgressFunc) {
 
+	// Always emit final progress update
+	defer fn(d)
+
 	// Set default interval.
 	if d.Interval == 0 {
-		d.Interval = uint64(400 / runtime.NumCPU())
+		d.Interval = uint64(150 / runtime.NumCPU())
 	}
 
-	sleepd := time.Duration(d.Interval) * time.Millisecond
+	ticker := time.NewTicker(time.Duration(d.Interval) * time.Millisecond)
+	defer ticker.Stop()
+
+	// Show initial progress file for tiny files
+	fn(d)
+	atomic.StoreUint64(&d.lastSize, atomic.LoadUint64(&d.size))
 
 	for {
-
-		if d.StopProgress {
-			break
-		}
-
-		// Context check.
 		select {
 		case <-d.ctx.Done():
 			return
-		default:
+
+		case <-ticker.C:
+			if d.StopProgress {
+				return
+			}
+
+			fn(d)
+			atomic.StoreUint64(&d.lastSize, atomic.LoadUint64(&d.size))
 		}
-
-		// Run progress func.
-		fn(d)
-
-		// Update last size
-		atomic.StoreUint64(&d.lastSize, atomic.LoadUint64(&d.size))
-
-		// Interval.
-		time.Sleep(sleepd)
 	}
 }
 
@@ -401,6 +401,7 @@ func (d *Download) DownloadChunk(ctx context.Context, c *Chunk, dest io.Writer) 
 	req.Header.Set("Range", contentRange)
 
 	if res, err = d.Client.Do(req); err != nil {
+		logWarn("GET %s (Range %s) failed: %v", d.URL, contentRange, err)
 		return err
 	}
 	defer res.Body.Close()
@@ -457,6 +458,7 @@ func (d *Download) downloadSingle(ctx context.Context) error {
 
 	res, err := d.Client.Do(req)
 	if err != nil {
+		logWarn("GET %s failed: %v", d.URL, err)
 		return err
 	}
 	defer res.Body.Close()
