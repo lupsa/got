@@ -22,7 +22,10 @@ import (
 var copyBufPool = sync.Pool{New: func() any { return make([]byte, 1024*1024) }}
 
 type (
-
+	part struct {
+		r    Range
+		path string
+	}
 	// Info holds downloadable file info.
 	Info struct {
 		Size      uint64
@@ -73,6 +76,12 @@ type (
 		Kid string
 		Key string
 	}
+)
+
+const (
+	oneMiB         = 1024 * 1024
+	sidxProbeMax   = 4 * oneMiB // 4 MiB
+	defaultMinPart = 0755
 )
 
 // makeAlignedChunks builds chunk ranges that never split any init/media segment range.
@@ -190,20 +199,13 @@ func makeAlignedChunks(totalSize, targetChunkSize uint64, sidxAll []*SidxRanges)
 // IMPORTANT: This method must NOT download the file to disk.
 // The actual download happens in Start() so progress reporting can run.
 func (d *Download) GetInfo() (*Info, error) {
-
-	var (
-		err error
-		req *http.Request
-		res *http.Response
-	)
-
-	// Probe with a 1-byte range request. If the server supports ranges it should
-	// respond with 206 and Content-Range: bytes 0-0/<total>.
-	if req, err = NewRequest(d.ctx, "GET", d.URL, append(d.Header, GotHeader{"Range", "bytes=0-0"})); err != nil {
+	req, err := d.newRangeProbeRequest()
+	if err != nil {
 		return &Info{}, err
 	}
 
-	if res, err = d.Client.Do(req); err != nil {
+	res, err := d.Client.Do(req)
+	if err != nil {
 		return &Info{}, err
 	}
 	defer res.Body.Close()
@@ -217,26 +219,13 @@ func (d *Download) GetInfo() (*Info, error) {
 
 	// Range supported.
 	if res.StatusCode == http.StatusPartialContent {
-		// Body should be tiny (1 byte). Only drain it when it's actually tiny,
-		// so a misbehaving server can't trick us into downloading a full file here.
-		if res.ContentLength > 0 && res.ContentLength <= 1024*1024 {
-			_, _ = io.Copy(io.Discard, res.Body)
+		d.drainTinyBody(res.Body, res.ContentLength)
+
+		info, err := d.infoFromPartialContent(res.Header.Get("content-range"))
+		if err != nil {
+			return &Info{}, err
 		}
 
-		cr := res.Header.Get("content-range")
-		if cr == "" {
-			return &Info{}, fmt.Errorf("expected content-range header on 206 response")
-		}
-		l := strings.Split(cr, "/")
-		if len(l) != 2 {
-			return &Info{}, fmt.Errorf("invalid content-range header: %s", cr)
-		}
-		length, perr := strconv.ParseUint(l[1], 10, 64)
-		if perr != nil {
-			return &Info{}, fmt.Errorf("invalid content-range total size: %s", cr)
-		}
-
-		info := &Info{Size: length, Rangeable: true}
 		// Best-effort sidx range extraction (does not affect errors).
 		d.tryFetchSidxRanges(d.ctx, info)
 		return info, nil
@@ -249,8 +238,36 @@ func (d *Download) GetInfo() (*Info, error) {
 		size = uint64(res.ContentLength)
 	}
 
-	info := &Info{Size: size, Rangeable: false}
-	return info, nil
+	return &Info{Size: size, Rangeable: false}, nil
+}
+
+func (d *Download) newRangeProbeRequest() (*http.Request, error) {
+	// Probe with a 1-byte range request. If the server supports ranges it should
+	// respond with 206 and Content-Range: bytes 0-0/<total>.
+	return NewRequest(d.ctx, "GET", d.URL, append(d.Header, GotHeader{"Range", "bytes=0-0"}))
+}
+
+func (d *Download) drainTinyBody(r io.Reader, n int64) {
+	// Body should be tiny (1 byte). Only drain it when it's actually tiny,
+	// so a misbehaving server can't trick us into downloading a full file here.
+	if n > 0 && n <= oneMiB {
+		_, _ = io.Copy(io.Discard, r)
+	}
+}
+
+func (d *Download) infoFromPartialContent(contentRange string) (*Info, error) {
+	if contentRange == "" {
+		return &Info{}, fmt.Errorf("expected content-range header on 206 response")
+	}
+	parts := strings.Split(contentRange, "/")
+	if len(parts) != 2 {
+		return &Info{}, fmt.Errorf("invalid content-range header: %s", contentRange)
+	}
+	length, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return &Info{}, fmt.Errorf("invalid content-range total size: %s", contentRange)
+	}
+	return &Info{Size: length, Rangeable: true}, nil
 }
 
 // tryFetchSidxRanges is a best-effort probe that downloads a small prefix of the file and
@@ -262,8 +279,7 @@ func (d *Download) tryFetchSidxRanges(ctx context.Context, info *Info) {
 
 	// Many fragmented MP4/DASH files place sidx near the start. We only fetch a small prefix
 	// to keep GetInfo() cheap.
-	const probeMax = 4 * 1024 * 1024 // 4 MiB
-	end := int64(probeMax - 1)
+	end := int64(sidxProbeMax - 1)
 	if info.Size > 0 {
 		last := int64(info.Size - 1)
 		if end > last {
@@ -306,7 +322,6 @@ func (d *Download) tryFetchSidxRanges(ctx context.Context, info *Info) {
 // Init set defaults and split file into chunks and gets Info,
 // you should call Init before Start
 func (d *Download) Init() (err error) {
-
 	// Set start time.
 	d.startedAt = time.Now()
 
@@ -334,12 +349,26 @@ func (d *Download) Init() (err error) {
 		return nil
 	}
 
+	d.applyDefaultsForRangeable()
+
+	// If we have sidx-derived segment ranges, prefer chunk boundaries that never
+	// split any init/media segment.
+	if aligned := makeAlignedChunks(d.info.Size, d.ChunkSize, d.info.SidxAll); len(aligned) > 0 {
+		d.chunks = aligned
+		return nil
+	}
+
+	d.chunks = buildFixedChunks(d.info.Size, d.ChunkSize)
+	return nil
+}
+
+func (d *Download) applyDefaultsForRangeable() {
 	// Set concurrency default.
 	if d.Concurrency == 0 {
 		d.Concurrency = getDefaultConcurrency()
 	}
 
-	// Set default chunk size
+	// Set default chunk size.
 	if d.ChunkSize == 0 {
 		d.ChunkSize = getDefaultChunkSize(d.info.Size, d.MinChunkSize, d.MaxChunkSize, uint64(d.Concurrency))
 	}
@@ -349,36 +378,39 @@ func (d *Download) Init() (err error) {
 	if d.ChunkSize >= d.info.Size {
 		d.ChunkSize = d.info.Size
 	}
+}
 
-	// If we have sidx-derived segment ranges, prefer chunk boundaries that never
-	// split any init/media segment.
-	if aligned := makeAlignedChunks(d.info.Size, d.ChunkSize, d.info.SidxAll); len(aligned) > 0 {
-		d.chunks = aligned
+func buildFixedChunks(totalSize, chunkSize uint64) []*Chunk {
+	if totalSize == 0 {
 		return nil
 	}
+	if chunkSize == 0 || chunkSize >= totalSize {
+		c := new(Chunk)
+		c.Start = 0
+		c.End = totalSize - 1
+		return []*Chunk{c}
+	}
 
-	chunksLen := (d.info.Size + d.ChunkSize - 1) / d.ChunkSize
-
+	chunksLen := (totalSize + chunkSize - 1) / chunkSize
 	if chunksLen == 0 {
 		chunksLen = 1
 	}
 
-	d.chunks = make([]*Chunk, 0, chunksLen)
-
+	chunks := make([]*Chunk, 0, chunksLen)
 	for i := uint64(0); i < chunksLen; i++ {
 		chunk := new(Chunk)
-		d.chunks = append(d.chunks, chunk)
+		chunk.Start = chunkSize * i
+		chunk.End = chunk.Start + chunkSize - 1
 
-		chunk.Start = d.ChunkSize * i
-		chunk.End = chunk.Start + d.ChunkSize - 1
-
-		if chunk.End >= d.info.Size || i == chunksLen-1 {
-			chunk.End = d.info.Size - 1
+		if chunk.End >= totalSize || i == chunksLen-1 {
+			chunk.End = totalSize - 1
+			chunks = append(chunks, chunk)
 			break
 		}
+		chunks = append(chunks, chunk)
 	}
 
-	return nil
+	return chunks
 }
 
 // Start downloads the file chunks, and merges them.
@@ -421,9 +453,33 @@ func (d *Download) Start() (err error) {
 	return err
 }
 
+// StartToTempParts downloads to a temp directory as:
+//
+//	_init.mp4 + 0000.mp4s, 0001.mp4s, ... (when sidx exists)
+//
+// or just numbered parts (fallback).
+func (d *Download) StartToTempParts(ctx context.Context) (string, []string, error) {
+	// Ensure init was called and chunk plan computed.
+	// (Init() is required before Start() too, but callers might not have done it.)
+	if d.info == nil || (d.IsRangeable() && len(d.chunks) == 0 && (d.info.SidxAll == nil || len(d.info.SidxAll) == 0)) {
+		if ctx != nil {
+			d.ctx = ctx
+		}
+		if err := d.Init(); err != nil {
+			return "", nil, err
+		}
+	}
+
+	// For non-range servers, you can't chunk-dump; fall back or error.
+	if d.info != nil && d.info.Rangeable == false {
+		return "", nil, fmt.Errorf("server does not support ranges; cannot dump parts")
+	}
+
+	return d.DownloadPartsIntoFinalDir(ctx)
+}
+
 // RunProgress runs ProgressFunc based on Interval and updates lastSize.
 func (d *Download) RunProgress(fn ProgressFunc) {
-
 	// Always emit final progress update
 	defer fn(d)
 
@@ -443,12 +499,10 @@ func (d *Download) RunProgress(fn ProgressFunc) {
 		select {
 		case <-d.ctx.Done():
 			return
-
 		case <-ticker.C:
 			if d.StopProgress {
 				return
 			}
-
 			fn(d)
 			atomic.StoreUint64(&d.lastSize, atomic.LoadUint64(&d.size))
 		}
@@ -456,19 +510,13 @@ func (d *Download) RunProgress(fn ProgressFunc) {
 }
 
 // Context returns download context.
-func (d *Download) Context() context.Context {
-	return d.ctx
-}
+func (d *Download) Context() context.Context { return d.ctx }
 
 // TotalSize returns file total size (0 if unknown).
-func (d *Download) TotalSize() uint64 {
-	return d.info.Size
-}
+func (d *Download) TotalSize() uint64 { return d.info.Size }
 
 // Size returns downloaded size.
-func (d *Download) Size() uint64 {
-	return atomic.LoadUint64(&d.size)
-}
+func (d *Download) Size() uint64 { return atomic.LoadUint64(&d.size) }
 
 // Speed returns download speed.
 func (d *Download) Speed() uint64 {
@@ -480,18 +528,14 @@ func (d *Download) Speed() uint64 {
 
 // AvgSpeed returns average download speed.
 func (d *Download) AvgSpeed() uint64 {
-
 	if totalMills := d.TotalCost().Milliseconds(); totalMills > 0 {
 		return uint64(atomic.LoadUint64(&d.size) / uint64(totalMills) * 1000)
 	}
-
 	return 0
 }
 
 // TotalCost returns download duration.
-func (d *Download) TotalCost() time.Duration {
-	return time.Since(d.startedAt)
-}
+func (d *Download) TotalCost() time.Duration { return time.Since(d.startedAt) }
 
 // Write updates progress size.
 func (d *Download) Write(b []byte) (int, error) {
@@ -501,9 +545,7 @@ func (d *Download) Write(b []byte) (int, error) {
 }
 
 // IsRangeable returns file server partial content support state.
-func (d *Download) IsRangeable() bool {
-	return d.info.Rangeable
-}
+func (d *Download) IsRangeable() bool { return d.info.Rangeable }
 
 // Download chunks
 func (d *Download) dl(ctx context.Context, cancel context.CancelFunc, dest io.WriterAt, errC chan error) {
@@ -539,12 +581,10 @@ func (d *Download) dl(ctx context.Context, cancel context.CancelFunc, dest io.Wr
 	once.Do(func() { errC <- nil })
 }
 
-// Return constant path which will not change once the download starts
+// Path returns constant path which will not change once the download starts.
 func (d *Download) Path() string {
-
-	// Set the default path
+	// Set the default path.
 	if d.path == "" {
-
 		d.path = GetFilename(d.URL) // default case
 		if d.Dest != "" {
 			d.path = d.Dest
@@ -555,31 +595,23 @@ func (d *Download) Path() string {
 		}
 		d.path = filepath.Join(d.Dir, d.path)
 	}
-
 	return d.path
 }
 
-func (d *Download) addProgress(n int) {
-	atomic.AddUint64(&d.size, uint64(n))
-}
+func (d *Download) addProgress(n int) { atomic.AddUint64(&d.size, uint64(n)) }
 
 // DownloadChunk downloads a file chunk.
 func (d *Download) DownloadChunk(ctx context.Context, c *Chunk, dest io.Writer) error {
-
-	var (
-		err error
-		req *http.Request
-		res *http.Response
-	)
-
-	if req, err = NewRequest(ctx, "GET", d.URL, d.Header); err != nil {
+	req, err := NewRequest(ctx, "GET", d.URL, d.Header)
+	if err != nil {
 		return err
 	}
 
 	contentRange := fmt.Sprintf("bytes=%d-%d", c.Start, c.End)
 	req.Header.Set("Range", contentRange)
 
-	if res, err = d.Client.Do(req); err != nil {
+	res, err := d.Client.Do(req)
+	if err != nil {
 		logWarn("GET %s (Range %s) failed: %v", d.URL, contentRange, err)
 		return err
 	}
@@ -589,7 +621,7 @@ func (d *Download) DownloadChunk(ctx context.Context, c *Chunk, dest io.Writer) 
 		return fmt.Errorf("expected 206 Partial Content, got %d", res.StatusCode)
 	}
 
-	// Verify the length
+	// Verify the length.
 	expectedLen := int64(c.End - c.Start + 1)
 	if res.ContentLength != -1 && res.ContentLength != expectedLen {
 		return fmt.Errorf(
@@ -606,32 +638,19 @@ func (d *Download) DownloadChunk(ctx context.Context, c *Chunk, dest io.Writer) 
 	limited := io.LimitReader(res.Body, expectedLen)
 
 	if d.Keys != nil {
-		// Count progress on encrypted bytes coming from the network:
-		tee := io.TeeReader(limited, d)
+		return fmt.Errorf("this feature is not yet implemented")
+	}
 
-		// Decrypt on-the-fly and write directly into final file at offset:
-		if err := d.decryptStreamWithShaka(ctx, tee, dest, "video"); err != nil {
-			// Optional: fallback to audio stream if video fails
-			if err2 := d.decryptStreamWithShaka(ctx, tee, dest, "audio"); err2 != nil {
-				return err // or return combined error
-			}
-		}
-		return nil
-	} else {
-
-		// Count progress by also writing the bytes into d (which only increments the counter).
-		n, err := io.CopyBuffer(io.MultiWriter(dest, d), limited, buf)
-		if err != nil {
-			return err
-		}
-		if n != expectedLen {
-			return fmt.Errorf("range request returned %d bytes, expected %d", n, expectedLen)
-		}
-
+	// Count progress by also writing the bytes into d (which only increments the counter).
+	n, err := io.CopyBuffer(io.MultiWriter(dest, d), limited, buf)
+	if err != nil {
+		return err
+	}
+	if n != expectedLen {
+		return fmt.Errorf("range request returned %d bytes, expected %d", n, expectedLen)
 	}
 
 	return nil
-
 }
 
 func (d *Download) downloadSingle(ctx context.Context) error {
@@ -667,11 +686,151 @@ func (d *Download) downloadSingle(ctx context.Context) error {
 
 	if d.Keys != nil {
 		return fmt.Errorf("Implement decryption of parts")
-	} else {
-		_, err = io.CopyBuffer(io.MultiWriter(file, d), res.Body, buf)
-		return err
 	}
 
+	_, err = io.CopyBuffer(io.MultiWriter(file, d), res.Body, buf)
+	return err
+}
+
+// DownloadPartsIntoFinalDir downloads init+segments (preferred via sidx) or falls back to d.chunks
+// into a temp folder next to the final output path, then renames it to "<final>.parts".
+//
+// Returns: partsDir (final), ordered file list (init first if present).
+func (d *Download) DownloadPartsIntoFinalDir(ctx context.Context) (string, []string, error) {
+	// Ensure Init() has run (Init fills d.info and d.chunks).
+	if d.info == nil {
+		if ctx != nil {
+			d.ctx = ctx
+		}
+		if err := d.Init(); err != nil {
+			return "", nil, err
+		}
+	}
+
+	// We can only do chunk/segment style when rangeable.
+	if d.info == nil || !d.info.Rangeable {
+		return "", nil, fmt.Errorf("server does not support ranges; cannot download parts")
+	}
+
+	if ctx == nil {
+		ctx = d.ctx
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	finalPath := d.Path() // honors -d via d.Dir join
+	tmpDir := finalPath + ".parts.tmp"
+	finalDir := finalPath + ".parts"
+
+	// Clean any previous tmp dir and ensure it exists.
+	_ = os.RemoveAll(tmpDir)
+	if err := os.MkdirAll(tmpDir, defaultMinPart); err != nil {
+		return "", nil, err
+	}
+
+	parts := d.buildPartsPlan(tmpDir)
+
+	// Download concurrently; cancel on first error.
+	var (
+		wg   sync.WaitGroup
+		sem  = make(chan struct{}, d.Concurrency)
+		once sync.Once
+		errC = make(chan error, 1)
+	)
+
+	created := make([]string, len(parts))
+
+	for i := range parts {
+		i := i
+		sem <- struct{}{}
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			p := parts[i]
+			f, err := os.Create(p.path)
+			if err != nil {
+				once.Do(func() { cancel(); errC <- err })
+				return
+			}
+			defer f.Close()
+
+			ch := &Chunk{Start: uint64(p.r.Start), End: uint64(p.r.End)}
+			if err := d.DownloadChunk(runCtx, ch, f); err != nil {
+				once.Do(func() { cancel(); errC <- err })
+				return
+			}
+			created[i] = p.path
+		}()
+	}
+
+	wg.Wait()
+
+	select {
+	case err := <-errC:
+		_ = os.RemoveAll(tmpDir)
+		return "", nil, err
+	default:
+	}
+
+	_ = os.RemoveAll(finalDir) // overwrite existing
+	if err := os.Rename(tmpDir, finalDir); err != nil {
+		// If rename fails (e.g. cross-device), keep tmp and report.
+		return tmpDir, created, fmt.Errorf("downloaded parts but failed to rename %q -> %q: %w", tmpDir, finalDir, err)
+	}
+
+	for i := range created {
+		created[i] = filepath.Join(finalDir, filepath.Base(created[i]))
+	}
+	return finalDir, created, nil
+}
+
+func (d *Download) buildPartsPlan(tmpDir string) []part {
+	var parts []part
+
+	// Prefer sidx init+segments if present.
+	if d.info.SidxAll != nil && len(d.info.SidxAll) > 0 && d.info.SidxAll[0] != nil {
+		sidx := d.info.SidxAll[0]
+
+		parts = append(parts, part{
+			r:    sidx.Init,
+			path: filepath.Join(tmpDir, "_init.mp4"),
+		})
+
+		width := paddedWidth(len(sidx.Segments))
+		for i, seg := range sidx.Segments {
+			name := fmt.Sprintf("%0*d.mp4s", width, i)
+			parts = append(parts, part{
+				r:    seg,
+				path: filepath.Join(tmpDir, name),
+			})
+		}
+		return parts
+	}
+
+	// Fallback: use computed d.chunks.
+	width := paddedWidth(len(d.chunks))
+	for i, ch := range d.chunks {
+		name := fmt.Sprintf("%0*d.mp4s", width, i)
+		parts = append(parts, part{
+			r:    Range{Start: int64(ch.Start), End: int64(ch.End)},
+			path: filepath.Join(tmpDir, name),
+		})
+	}
+	return parts
+}
+
+func paddedWidth(n int) int {
+	width := 4
+	if n >= 100000 {
+		return 6
+	}
+	if n >= 10000 {
+		return 5
+	}
+	return width
 }
 
 // NewDownload returns new *Download with context.
@@ -685,24 +844,20 @@ func NewDownload(ctx context.Context, URL, dest string) *Download {
 }
 
 func getDefaultConcurrency() uint {
-
 	c := uint(runtime.NumCPU() * 3)
 
-	// Set default max concurrency to 20.
+	// Set default max concurrency to 64.
 	if c > 64 {
 		c = 64
 	}
-
 	// Set default min concurrency to 4.
 	if c <= 2 {
 		c = 4
 	}
-
 	return c
 }
 
 func getDefaultChunkSize(totalSize, min, max, concurrency uint64) uint64 {
-
 	cs := totalSize / concurrency
 
 	// if chunk size >= 102400000 bytes set default to (ChunkSize / 2)
@@ -712,9 +867,7 @@ func getDefaultChunkSize(totalSize, min, max, concurrency uint64) uint64 {
 
 	// Set default min chunk size to 2m, or file size / 2
 	if min == 0 {
-
 		min = 2097152
-
 		if min >= totalSize {
 			min = totalSize / 2
 		}
