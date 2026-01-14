@@ -421,6 +421,31 @@ func (d *Download) Start() (err error) {
 	return err
 }
 
+// StartToTempParts downloads to a temp directory as:
+//
+//	_init.mp4 + 0000.mp4s, 0001.mp4s, ... (when sidx exists)
+//
+// or just numbered parts (fallback).
+func (d *Download) StartToTempParts(ctx context.Context) (string, []string, error) {
+	// Ensure init was called and chunk plan computed.
+	// (Init() is required before Start() too, but callers might not have done it.)
+	if d.info == nil || (d.IsRangeable() && len(d.chunks) == 0 && (d.info.SidxAll == nil || len(d.info.SidxAll) == 0)) {
+		if ctx != nil {
+			d.ctx = ctx
+		}
+		if err := d.Init(); err != nil {
+			return "", nil, err
+		}
+	}
+
+	// For non-range servers, you can't chunk-dump; fall back or error.
+	if d.info != nil && d.info.Rangeable == false {
+		return "", nil, fmt.Errorf("server does not support ranges; cannot dump parts")
+	}
+
+	return d.DownloadPartsIntoFinalDir(ctx)
+}
+
 // RunProgress runs ProgressFunc based on Interval and updates lastSize.
 func (d *Download) RunProgress(fn ProgressFunc) {
 
@@ -606,17 +631,7 @@ func (d *Download) DownloadChunk(ctx context.Context, c *Chunk, dest io.Writer) 
 	limited := io.LimitReader(res.Body, expectedLen)
 
 	if d.Keys != nil {
-		// Count progress on encrypted bytes coming from the network:
-		tee := io.TeeReader(limited, d)
-
-		// Decrypt on-the-fly and write directly into final file at offset:
-		if err := d.decryptStreamWithShaka(ctx, tee, dest, "video"); err != nil {
-			// Optional: fallback to audio stream if video fails
-			if err2 := d.decryptStreamWithShaka(ctx, tee, dest, "audio"); err2 != nil {
-				return err // or return combined error
-			}
-		}
-		return nil
+		return fmt.Errorf("this feature is not yet implemented")
 	} else {
 
 		// Count progress by also writing the bytes into d (which only increments the counter).
@@ -672,6 +687,146 @@ func (d *Download) downloadSingle(ctx context.Context) error {
 		return err
 	}
 
+}
+
+// DownloadPartsIntoFinalDir downloads init+segments (preferred via sidx) or falls back to d.chunks
+// into a temp folder next to the final output path, then renames it to "<final>.parts".
+//
+// Returns: partsDir (final), ordered file list (init first if present).
+func (d *Download) DownloadPartsIntoFinalDir(ctx context.Context) (string, []string, error) {
+	// Ensure Init() has run (Init fills d.info and d.chunks).
+	if d.info == nil {
+		if ctx != nil {
+			d.ctx = ctx
+		}
+		if err := d.Init(); err != nil {
+			return "", nil, err
+		}
+	}
+
+	// We can only do chunk/segment style when rangeable.
+	if d.info == nil || !d.info.Rangeable {
+		return "", nil, fmt.Errorf("server does not support ranges; cannot download parts")
+	}
+
+	if ctx == nil {
+		ctx = d.ctx
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	finalPath := d.Path() // honors -d via d.Dir join :contentReference[oaicite:3]{index=3}
+	tmpDir := finalPath + ".parts.tmp"
+	finalDir := finalPath + ".parts"
+
+	// Clean any previous tmp dir and ensure it exists.
+	_ = os.RemoveAll(tmpDir)
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		return "", nil, err
+	}
+
+	// Build the plan: ordered list of parts to write.
+	type part struct {
+		r    Range
+		path string
+	}
+	var parts []part
+
+	// Prefer sidx init+segments if present.
+	if d.info.SidxAll != nil && len(d.info.SidxAll) > 0 && d.info.SidxAll[0] != nil {
+		sidx := d.info.SidxAll[0]
+
+		parts = append(parts, part{
+			r:    sidx.Init,
+			path: filepath.Join(tmpDir, "_init.mp4"),
+		})
+
+		width := 4
+		if n := len(sidx.Segments); n >= 10000 {
+			width = 5
+		} else if n >= 100000 {
+			width = 6
+		}
+
+		for i, seg := range sidx.Segments {
+			name := fmt.Sprintf("%0*d.mp4s", width, i)
+			parts = append(parts, part{
+				r:    seg,
+				path: filepath.Join(tmpDir, name),
+			})
+		}
+	} else {
+		// Fallback: use computed d.chunks.
+		width := 4
+		if n := len(d.chunks); n >= 10000 {
+			width = 5
+		} else if n >= 100000 {
+			width = 6
+		}
+
+		for i, ch := range d.chunks {
+			name := fmt.Sprintf("%0*d.mp4s", width, i)
+			parts = append(parts, part{
+				r:    Range{Start: int64(ch.Start), End: int64(ch.End)},
+				path: filepath.Join(tmpDir, name),
+			})
+		}
+	}
+
+	// Download concurrently; cancel on first error.
+	var (
+		wg   sync.WaitGroup
+		sem  = make(chan struct{}, d.Concurrency)
+		once sync.Once
+		errC = make(chan error, 1)
+	)
+	created := make([]string, len(parts))
+
+	for i := range parts {
+		i := i
+		sem <- struct{}{}
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			p := parts[i]
+			f, err := os.Create(p.path)
+			if err != nil {
+				once.Do(func() { cancel(); errC <- err })
+				return
+			}
+			defer f.Close()
+
+			ch := &Chunk{Start: uint64(p.r.Start), End: uint64(p.r.End)}
+			if err := d.DownloadChunk(runCtx, ch, f); err != nil {
+				once.Do(func() { cancel(); errC <- err })
+				return
+			}
+			created[i] = p.path
+		}()
+	}
+
+	wg.Wait()
+
+	select {
+	case err := <-errC:
+		_ = os.RemoveAll(tmpDir)
+		return "", nil, err
+	default:
+	}
+
+	_ = os.RemoveAll(finalDir) // overwrite existing
+	if err := os.Rename(tmpDir, finalDir); err != nil {
+		// If rename fails (e.g. cross-device), keep tmp and report.
+		return tmpDir, created, fmt.Errorf("downloaded parts but failed to rename %q -> %q: %w", tmpDir, finalDir, err)
+	}
+
+	for i := range created {
+		created[i] = filepath.Join(finalDir, filepath.Base(created[i]))
+	}
+	return finalDir, created, nil
 }
 
 // NewDownload returns new *Download with context.

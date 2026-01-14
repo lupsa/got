@@ -104,6 +104,23 @@ func (g Got) Do(dl *Download) error {
 	return dl.Start()
 }
 
+func (g Got) DoParts(dl *Download) (string, []string, error) {
+	if dl.ctx == nil {
+		dl.ctx = g.ctx
+	}
+	if dl.Client == nil {
+		dl.Client = g.Client
+	}
+	if err := dl.Init(); err != nil {
+		return "", nil, err
+	}
+	if g.ProgressFunc != nil {
+		defer func() { dl.StopProgress = true }()
+		go dl.RunProgress(g.ProgressFunc)
+	}
+	return dl.DownloadPartsIntoFinalDir(dl.ctx)
+}
+
 // New returns new *Got with default context and client.
 func New() *Got {
 	return NewWithContext(context.Background())

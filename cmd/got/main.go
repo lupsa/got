@@ -91,6 +91,10 @@ func main() {
 				Usage:   `Set kid:key for decryption`,
 				Aliases: []string{"k"},
 			},
+			&cli.BoolFlag{
+				Name:  "parts",
+				Usage: "Download into a temp directory as init + media chunks (N_m3u8DL-RE style)",
+			},
 		},
 		Version: version,
 		Authors: []*cli.Author{
@@ -313,13 +317,13 @@ func multiDownload(ctx context.Context, c *cli.Context, g *got.Got, scanner *buf
 }
 
 func download(ctx context.Context, c *cli.Context, g *got.Got, url string) (err error) {
-	_ = ctx // ctx is carried by g (got.NewWithContext) and injected by Got.Do.
+	_ = ctx
 
 	if url, err = getURL(url); err != nil {
 		return err
 	}
 
-	return g.Do(&got.Download{
+	dl := &got.Download{
 		URL:         url,
 		Dir:         c.String("dir"),
 		Dest:        c.String("output"),
@@ -328,7 +332,25 @@ func download(ctx context.Context, c *cli.Context, g *got.Got, url string) (err 
 		Interval:    150,
 		ChunkSize:   c.Uint64("size"),
 		Concurrency: c.Uint("concurrency"),
-	})
+	}
+
+	// 🔹 NEW PATH
+	if c.Bool("parts") {
+		tmpDir, parts, err := g.DoParts(dl)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println()
+		fmt.Println("Parts written to:", tmpDir)
+		for _, p := range parts {
+			fmt.Println(" ", p)
+		}
+		return nil
+	}
+
+	// 🔹 EXISTING BEHAVIOR
+	return g.Do(dl)
 }
 
 func getURL(URL string) (string, error) {
