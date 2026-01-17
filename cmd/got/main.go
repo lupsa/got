@@ -334,22 +334,15 @@ func download(ctx context.Context, c *cli.Context, g *got.Got, url string) (err 
 		Concurrency: c.Uint("concurrency"),
 	}
 
-	// 🔹 NEW PATH
-	if c.Bool("parts") {
-		tmpDir, parts, err := g.DoParts(dl)
+	if c.Bool("parts") || c.StringSlice("key") != nil {
+		_, _, err := g.DoParts(dl)
 		if err != nil {
 			return err
 		}
 
-		fmt.Println()
-		fmt.Println("Parts written to:", tmpDir)
-		for _, p := range parts {
-			fmt.Println(" ", p)
-		}
 		return nil
 	}
 
-	// 🔹 EXISTING BEHAVIOR
 	return g.Do(dl)
 }
 

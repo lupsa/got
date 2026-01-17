@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"os/exec"
+	  "encoding/binary"
 )
 
 // Reuse large copy buffers across goroutines to reduce allocations/GC.
@@ -22,7 +24,10 @@ import (
 var copyBufPool = sync.Pool{New: func() any { return make([]byte, 1024*1024) }}
 
 type (
-
+	part struct {
+	    r    Range
+	    path string
+	}
 	// Info holds downloadable file info.
 	Info struct {
 		Size      uint64
@@ -605,7 +610,7 @@ func (d *Download) DownloadChunk(ctx context.Context, c *Chunk, dest io.Writer) 
 	req.Header.Set("Range", contentRange)
 
 	if res, err = d.Client.Do(req); err != nil {
-		logWarn("GET %s (Range %s) failed: %v", d.URL, contentRange, err)
+		//logWarn("GET %s (Range %s) failed: %v", d.URL, contentRange, err)
 		return err
 	}
 	defer res.Body.Close()
@@ -630,10 +635,6 @@ func (d *Download) DownloadChunk(ctx context.Context, c *Chunk, dest io.Writer) 
 	// that (incorrectly) sends more data than the requested range.
 	limited := io.LimitReader(res.Body, expectedLen)
 
-	if d.Keys != nil {
-		return fmt.Errorf("this feature is not yet implemented")
-	} else {
-
 		// Count progress by also writing the bytes into d (which only increments the counter).
 		n, err := io.CopyBuffer(io.MultiWriter(dest, d), limited, buf)
 		if err != nil {
@@ -643,7 +644,7 @@ func (d *Download) DownloadChunk(ctx context.Context, c *Chunk, dest io.Writer) 
 			return fmt.Errorf("range request returned %d bytes, expected %d", n, expectedLen)
 		}
 
-	}
+	
 
 	return nil
 
@@ -715,21 +716,17 @@ func (d *Download) DownloadPartsIntoFinalDir(ctx context.Context) (string, []str
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	finalPath := d.Path() // honors -d via d.Dir join :contentReference[oaicite:3]{index=3}
+	finalPath := d.Path()
 	tmpDir := finalPath + ".parts.tmp"
 	finalDir := finalPath + ".parts"
 
-	// Clean any previous tmp dir and ensure it exists.
 	_ = os.RemoveAll(tmpDir)
 	if err := os.MkdirAll(tmpDir, 0755); err != nil {
 		return "", nil, err
 	}
 
 	// Build the plan: ordered list of parts to write.
-	type part struct {
-		r    Range
-		path string
-	}
+
 	var parts []part
 
 	// Prefer sidx init+segments if present.
@@ -757,6 +754,7 @@ func (d *Download) DownloadPartsIntoFinalDir(ctx context.Context) (string, []str
 		}
 	} else {
 		// Fallback: use computed d.chunks.
+		// WARNING: this can split MP4 boxes; streaming decrypt+merge is unreliable without real segment boundaries.
 		width := 4
 		if n := len(d.chunks); n >= 10000 {
 			width = 5
@@ -773,14 +771,65 @@ func (d *Download) DownloadPartsIntoFinalDir(ctx context.Context) (string, []str
 		}
 	}
 
-	// Download concurrently; cancel on first error.
+	ready := make([]chan struct{}, len(parts))
+	for i := range ready {
+		ready[i] = make(chan struct{})
+	}
+
 	var (
-		wg   sync.WaitGroup
-		sem  = make(chan struct{}, d.Concurrency)
 		once sync.Once
 		errC = make(chan error, 1)
 	)
-	created := make([]string, len(parts))
+	fail := func(err error) {
+		once.Do(func() {
+			// unblock anyone waiting on ready[i]
+			for i := range ready {
+				select {
+				case <-ready[i]:
+				default:
+					close(ready[i])
+				}
+			}
+			cancel()
+			errC <- err
+		})
+	}
+
+	if len(parts) < 2 {
+		_ = os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("need init + at least one segment")
+	}
+
+	keysArg, err := d.shakaKeysArg()
+	if err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return "", nil, err
+	}
+
+	// Choose output name:
+	outPath := finalPath // + ".clear.mp4"
+	streamType := "video" // change to "audio" for audio-only
+
+	decDone := startDecryptAndMergeWhileDownloading(
+		runCtx,
+		d.packagerPath(),
+		keysArg,
+		streamType,
+		tmpDir,
+		parts,
+		ready,
+		outPath,
+		8,
+		fail,
+	)
+
+	// ------------------------------------------------------------
+	// Existing: Download concurrently; CHANGE to close ready[i]
+	// ------------------------------------------------------------
+	var (
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, d.Concurrency)
+	)
 
 	for i := range parts {
 		i := i
@@ -794,22 +843,51 @@ func (d *Download) DownloadPartsIntoFinalDir(ctx context.Context) (string, []str
 			p := parts[i]
 			f, err := os.Create(p.path)
 			if err != nil {
-				once.Do(func() { cancel(); errC <- err })
+				fail(err)
 				return
 			}
-			defer f.Close()
 
 			ch := &Chunk{Start: uint64(p.r.Start), End: uint64(p.r.End)}
 			if err := d.DownloadChunk(runCtx, ch, f); err != nil {
-				once.Do(func() { cancel(); errC <- err })
+				_ = f.Close()
+				fail(err)
 				return
 			}
-			created[i] = p.path
+			if err := f.Close(); err != nil {
+				fail(err)
+				return
+			}
+
+			close(ready[i])
 		}()
 	}
 
 	wg.Wait()
 
+	select {
+	case derr := <-decDone:
+		if derr != nil {
+			_ = os.RemoveAll(tmpDir)
+			return "", nil, derr
+		}
+	case err := <-errC:
+		_ = os.RemoveAll(tmpDir)
+		return "", nil, err
+	default:
+		// If downloads finished but decrypt still running, wait:
+		select {
+		case derr := <-decDone:
+			if derr != nil {
+				_ = os.RemoveAll(tmpDir)
+				return "", nil, derr
+			}
+		case err := <-errC:
+			_ = os.RemoveAll(tmpDir)
+			return "", nil, err
+		}
+	}
+
+	// If any downloader error happened:
 	select {
 	case err := <-errC:
 		_ = os.RemoveAll(tmpDir)
@@ -817,17 +895,537 @@ func (d *Download) DownloadPartsIntoFinalDir(ctx context.Context) (string, []str
 	default:
 	}
 
-	_ = os.RemoveAll(finalDir) // overwrite existing
-	if err := os.Rename(tmpDir, finalDir); err != nil {
-		// If rename fails (e.g. cross-device), keep tmp and report.
-		return tmpDir, created, fmt.Errorf("downloaded parts but failed to rename %q -> %q: %w", tmpDir, finalDir, err)
+	// ------------------------------------------------------------
+	// CHANGE HERE: when streaming, don't rename tmpDir -> finalDir.
+	// Instead, cleanup tmpDir and return final output file.
+	// ------------------------------------------------------------
+	_ = os.RemoveAll(tmpDir)
+	_ = os.RemoveAll(finalDir) // keep behavior if you want; optional
+
+	return outPath, []string{outPath}, nil
+}
+
+type decResult struct {
+	idx     int
+	fragOut string
+	err     error
+}
+
+// startDecryptAndMergeWhileDownloading runs concurrently with the downloader.
+//
+// It uses Shaka Packager as a "decrypt engine" on small, parseable MP4 inputs.
+// IMPORTANT: Shaka Packager will not emit output for init-only MP4 (no samples), so we:
+//
+//  1) wait for init + first segment
+//  2) build combined0 = init + seg0
+//  3) decrypt combined0 -> dec0.mp4
+//  4) extract init_clear (everything before first moof) + frag0 (from first moof onward)
+//  5) open final output, write init_clear once, append frag0
+//  6) for seg1..N: decrypt (init+segN) -> decN.mp4 -> extract fragN (moof+mdat only)
+//  7) merge goroutine appends fragN strictly in order
+//
+// parts: ordered list where parts[0] is init and parts[1:] are segments in order.
+// ready[i]: must be closed when parts[i].path is fully downloaded.
+// fail(err): cancels outer context and unblocks waiters (your helper).
+func startDecryptAndMergeWhileDownloading(
+	ctx context.Context,
+	packagerPath, keysArg, streamType, tmpDir string,
+	parts []part,
+	ready []chan struct{},
+	outPath string,
+	workers int,
+	fail func(error),
+) <-chan error {
+	done := make(chan error, 1)
+
+	if workers <= 0 {
+		workers = 4
+	}
+	if streamType == "" {
+		streamType = "video"
 	}
 
-	for i := range created {
-		created[i] = filepath.Join(finalDir, filepath.Base(created[i]))
+	type decResult struct {
+		idx     int    // segment index (0 == parts[1], 1 == parts[2], ...)
+		fragOut string // decrypted fragment-only file (starts at moof)
+		err     error
 	}
-	return finalDir, created, nil
+
+	// Helper: decrypt init+seg into decrypted mp4 (ftyp/moov/moof/mdat...)
+	shakaDecryptCombined := func(segIdx int, initPath, segPath string) (decPath string, err error) {
+		combined := filepath.Join(tmpDir, fmt.Sprintf("comb_%06d.mp4", segIdx))
+		if err := concatTwoFiles(combined, initPath, segPath); err != nil {
+			return "", err
+		}
+
+		decCombined := filepath.Join(tmpDir, fmt.Sprintf("dec_%06d.mp4", segIdx))
+		if err := shakaDecryptFile(ctx, packagerPath, keysArg, streamType, tmpDir, combined, decCombined); err != nil {
+			_ = os.Remove(combined)
+			return "", err
+		}
+		_ = os.Remove(combined)
+		return decCombined, nil
+	}
+
+	// Helper: extract init (everything before first top-level moof) to outPath.
+	// NOTE: This version assumes 32-bit box sizes for top-level boxes (typical CMAF).
+	extractInitUpToMoof := func(inPath, outPath string) error {
+		in, err := os.Open(inPath)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+
+		out, err := os.Create(outPath)
+		if err != nil {
+			return err
+		}
+		defer out.Close()
+
+		for {
+			var hdr [8]byte
+			_, err := io.ReadFull(in, hdr[:])
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return fmt.Errorf("no moof found in %s", inPath)
+			}
+			if err != nil {
+				return err
+			}
+
+			size32 := binary.BigEndian.Uint32(hdr[0:4])
+			typ := string(hdr[4:8])
+
+			if size32 < 8 || size32 == 1 {
+				return fmt.Errorf("unsupported/invalid top-level box size=%d type=%q in %s (need largesize support?)", size32, typ, inPath)
+			}
+
+			// Stop before moof (init is everything before the first moof).
+			if typ == "moof" {
+				return nil
+			}
+
+			// Write header + payload.
+			if _, err := out.Write(hdr[:]); err != nil {
+				return err
+			}
+			payload := int64(size32) - 8
+			if payload > 0 {
+				if _, err := io.CopyN(out, in, payload); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	go func() {
+		// Basic validation.
+		if len(parts) < 2 {
+			err := fmt.Errorf("need init + at least one segment")
+			fail(err)
+			done <- err
+			return
+		}
+		if len(ready) != len(parts) {
+			err := fmt.Errorf("ready length (%d) != parts length (%d)", len(ready), len(parts))
+			fail(err)
+			done <- err
+			return
+		}
+
+		initPath := parts[0].path
+
+		// 1) Wait for init and seg0 to be downloaded.
+		select {
+		case <-ctx.Done():
+			done <- ctx.Err()
+			return
+		case <-ready[0]:
+		}
+		select {
+		case <-ctx.Done():
+			done <- ctx.Err()
+			return
+		case <-ready[1]:
+		}
+
+		// 2) Decrypt combined0.
+		seg0Path := parts[1].path
+		dec0, err := shakaDecryptCombined(0, initPath, seg0Path)
+		if err != nil {
+			err = fmt.Errorf("decrypt combined seg0: %w", err)
+			fail(err)
+			done <- err
+			return
+		}
+		defer os.Remove(dec0)
+
+		// 3) Extract init_clear and frag0 from dec0.
+		initClear := filepath.Join(tmpDir, "init_clear.mp4")
+		if err := extractInitUpToMoof(dec0, initClear); err != nil {
+			err = fmt.Errorf("extract init_clear: %w", err)
+			fail(err)
+			done <- err
+			return
+		}
+
+		frag0 := filepath.Join(tmpDir, "frag_000000.m4s")
+		if err := stripToFirstMoof(dec0, frag0); err != nil {
+			err = fmt.Errorf("extract frag0: %w", err)
+			fail(err)
+			done <- err
+			return
+		}
+
+		// 4) Open output and write init once + frag0.
+		if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
+			fail(err)
+			done <- err
+			return
+		}
+
+		outF, err := os.Create(outPath)
+		if err != nil {
+			fail(err)
+			done <- err
+			return
+		}
+		defer outF.Close()
+
+		if err := copyFileToWriter(outF, initClear); err != nil {
+			err = fmt.Errorf("write init_clear: %w", err)
+			fail(err)
+			done <- err
+			return
+		}
+		if err := appendFile(outF, frag0); err != nil {
+			err = fmt.Errorf("append frag0: %w", err)
+			fail(err)
+			done <- err
+			return
+		}
+		_ = os.Remove(frag0)
+
+		// 5) Decrypt remaining segments concurrently (segIdx 1..N-1) and merge in order.
+		// Segment index here: 0 means parts[1], 1 means parts[2], etc.
+		// We already processed segIdx=0, so next expected is 1.
+		next := 1
+		pending := make(map[int]string, 64)
+
+		jobs := make(chan int, workers*2)           // segIdx (>=1)
+		results := make(chan decResult, workers*2)  // out-of-order results
+
+		// Feed jobs when each segment download completes.
+		go func() {
+			defer close(jobs)
+			for segIdx := 1; segIdx < len(parts)-1; segIdx++ {
+				partIndex := segIdx + 1 // segIdx=1 -> parts[2]
+				select {
+				case <-ctx.Done():
+					return
+				case <-ready[partIndex]:
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case jobs <- segIdx:
+				}
+			}
+		}()
+
+		// Workers.
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for w := 0; w < workers; w++ {
+			go func() {
+				defer wg.Done()
+				for segIdx := range jobs {
+					segPath := parts[segIdx+1].path // segIdx=1 -> parts[2]
+
+					decPath, err := shakaDecryptCombined(segIdx, initPath, segPath)
+					if err != nil {
+						results <- decResult{idx: segIdx, err: fmt.Errorf("decrypt seg %d: %w", segIdx, err)}
+						continue
+					}
+
+					fragOnly := filepath.Join(tmpDir, fmt.Sprintf("frag_%06d.m4s", segIdx))
+					if err := stripToFirstMoof(decPath, fragOnly); err != nil {
+						_ = os.Remove(decPath)
+						results <- decResult{idx: segIdx, err: fmt.Errorf("strip moof seg %d: %w", segIdx, err)}
+						continue
+					}
+					_ = os.Remove(decPath)
+
+					results <- decResult{idx: segIdx, fragOut: fragOnly}
+				}
+			}()
+		}
+
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
+
+		// Merge results in order.
+		for {
+			select {
+			case <-ctx.Done():
+				done <- ctx.Err()
+				return
+
+			case r, ok := <-results:
+				if !ok {
+					// flush remaining pending in order
+					for {
+						p, ok := pending[next]
+						if !ok {
+							break
+						}
+						if err := appendFile(outF, p); err != nil {
+							err = fmt.Errorf("append frag %d: %w", next, err)
+							fail(err)
+							done <- err
+							return
+						}
+						_ = os.Remove(p)
+						delete(pending, next)
+						next++
+					}
+
+					// Validate complete
+					if next != len(parts)-1 {
+						err := fmt.Errorf("merge incomplete: wrote %d/%d segments", next, len(parts)-1)
+						fail(err)
+						done <- err
+						return
+					}
+
+					done <- nil
+					return
+				}
+
+				if r.err != nil {
+					fail(r.err)
+					done <- r.err
+					return
+				}
+
+				pending[r.idx] = r.fragOut
+
+				// Flush contiguous
+				for {
+					p, ok := pending[next]
+					if !ok {
+						break
+					}
+					if err := appendFile(outF, p); err != nil {
+						err = fmt.Errorf("append frag %d: %w", next, err)
+						fail(err)
+						done <- err
+						return
+					}
+					_ = os.Remove(p)
+					delete(pending, next)
+					next++
+				}
+			}
+		}
+	}()
+
+	return done
 }
+
+
+func shakaDecryptFile(ctx context.Context, packagerPath, keysArg, streamType, tempDir, inPath, outPath string) error {
+	args := []string{
+		fmt.Sprintf("in=%s,stream=%s,output=%s", inPath, streamType, outPath),
+		"--enable_raw_key_decryption",
+		"--keys", keysArg,
+		"--temp_dir", tempDir,
+		"--v=0",
+		//"--quiet",
+	}
+	cmd := exec.CommandContext(ctx, packagerPath, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func copyFileToWriter(dst io.Writer, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(dst, f)
+	return err
+}
+
+func appendFile(dst *os.File, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(dst, f)
+	_ = f.Close()
+	return err
+}
+
+func concatTwoFiles(outPath, initPath, segPath string) error {
+	out, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if err := copyFileToWriter(out, initPath); err != nil {
+		return err
+	}
+	if err := copyFileToWriter(out, segPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func stripToFirstMoof(inPath, outPath string) error {
+	in, err := os.Open(inPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	var hdr [8]byte
+	var offset int64 = 0
+
+	for {
+		_, err := io.ReadFull(in, hdr[:])
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return fmt.Errorf("no moof found in %s", inPath)
+		}
+		if err != nil {
+			return err
+		}
+
+		size32 := binary.BigEndian.Uint32(hdr[0:4])
+		typ := string(hdr[4:8])
+
+		headerSize := int64(8)
+		boxSize := int64(size32)
+
+		if size32 == 1 {
+			var ext [8]byte
+			if _, err := io.ReadFull(in, ext[:]); err != nil {
+				return err
+			}
+			boxSize = int64(binary.BigEndian.Uint64(ext[:]))
+			headerSize = 16
+		}
+		if boxSize < headerSize {
+			return fmt.Errorf("invalid box size %d at offset %d in %s", boxSize, offset, inPath)
+		}
+
+		// if moof, seek back to start of box and copy remainder
+		if typ == "moof" {
+			if _, err := in.Seek(offset, io.SeekStart); err != nil {
+				return err
+			}
+			_, err := io.Copy(out, in)
+			return err
+		}
+
+		offset += boxSize
+		if _, err := in.Seek(offset, io.SeekStart); err != nil {
+			return err
+		}
+	}
+}
+
+func extractInitUpToMoof(inPath, outPath string) error {
+	in, err := os.Open(inPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	var hdr [8]byte
+	for {
+		_, err := io.ReadFull(in, hdr[:])
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return fmt.Errorf("no moof found in %s", inPath)
+		}
+		if err != nil {
+			return err
+		}
+
+		size32 := binary.BigEndian.Uint32(hdr[0:4])
+		typ := string(hdr[4:8])
+
+		headerSize := int64(8)
+		boxSize := int64(size32)
+
+		if size32 == 1 {
+			var ext [8]byte
+			if _, err := io.ReadFull(in, ext[:]); err != nil {
+				return err
+			}
+			boxSize = int64(binary.BigEndian.Uint64(ext[:]))
+			headerSize = 16
+		}
+		if boxSize < headerSize {
+			return fmt.Errorf("invalid box size %d in %s", boxSize, inPath)
+		}
+
+		// If this is moof, stop; init is everything before moof.
+		if typ == "moof" {
+			return nil
+		}
+
+		// Write the whole box (header already read) to out.
+		if _, err := out.Write(hdr[:]); err != nil {
+			return err
+		}
+		if headerSize == 16 {
+			// We already consumed the largesize bytes into ext in memory above,
+			// but did not write them. So we must re-read them or track them.
+			// Easiest: seek back 8 and read+write full 16 header.
+			if _, err := in.Seek(-8, io.SeekCurrent); err != nil {
+				return err
+			}
+			var fullHdr [16]byte
+			if _, err := io.ReadFull(in, fullHdr[:]); err != nil {
+				return err
+			}
+			if _, err := out.Write(fullHdr[:]); err != nil {
+				return err
+			}
+			// We wrote hdr twice in this branch, so adjust:
+			// Simpler alternative: DON'T use this largesize branch unless needed.
+			// (Most CMAF top-level boxes are 32-bit sized.)
+			return fmt.Errorf("largesize init extraction not implemented cleanly; add proper handling if needed")
+		}
+
+		// Copy the payload.
+		payload := boxSize - headerSize
+		if payload > 0 {
+			if _, err := io.CopyN(out, in, payload); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+
 
 // NewDownload returns new *Download with context.
 func NewDownload(ctx context.Context, URL, dest string) *Download {
